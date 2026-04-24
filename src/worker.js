@@ -85,6 +85,9 @@ async function handleOpenAI(request, cfToken, env) {
     await request.json();
 
   const cfModel    = model || DEFAULT_MODEL;
+  const modelErr   = validateModel(cfModel);
+  if (modelErr) return modelErr;
+
   const cfMessages = normalizeMessages(messages, system);
   const cfBody     = {
     messages: cfMessages,
@@ -124,6 +127,9 @@ async function handleAnthropic(request, cfToken, env) {
     await request.json();
 
   const cfModel    = model || DEFAULT_MODEL;
+  const modelErr   = validateModel(cfModel);
+  if (modelErr) return modelErr;
+
   const cfMessages = normalizeMessages(messages, system);
   const cfBody     = {
     messages: cfMessages,
