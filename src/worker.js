@@ -42,6 +42,7 @@ export default {
     const { pathname } = new URL(request.url);
 
     try {
+      if (request.method === "GET"  && pathname === "/debug")               return cors(await handleDebug(cfToken, env));
       if (request.method === "GET"  && pathname === "/v1/models")           return cors(await handleModels(cfToken, env));
       if (request.method === "POST" && pathname === "/v1/chat/completions") return cors(await handleOpenAI(request, cfToken, env));
       if (request.method === "POST" && pathname === "/v1/messages")         return cors(await handleAnthropic(request, cfToken, env));
@@ -333,4 +334,32 @@ function cors(response) {
   r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   r.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version");
   return r;
+}
+
+// ---------------------------------------------------------------------------
+// GET /debug — show exactly what the worker sees
+// ---------------------------------------------------------------------------
+async function handleDebug(cfToken, env) {
+  const accountId = env.CF_ACCOUNT_ID ?? "(not set)";
+  const tokenPreview = cfToken ? cfToken.slice(0, 6) + "..." + cfToken.slice(-4) : "(empty)";
+  const testUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
+
+  // Try the actual request to CF so we can show the raw response
+  let cfStatus, cfBody;
+  try {
+    const res = await fetch(testUrl, { headers: { Authorization: `Bearer ${cfToken}` } });
+    cfStatus = res.status;
+    cfBody   = await res.json();
+  } catch (e) {
+    cfStatus = "fetch_error";
+    cfBody   = e.message;
+  }
+
+  return json({
+    cf_account_id:  accountId,
+    token_preview:  tokenPreview,
+    test_url:       testUrl,
+    cf_status:      cfStatus,
+    cf_response:    cfBody,
+  });
 }
