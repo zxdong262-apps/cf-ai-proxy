@@ -1,0 +1,30 @@
+{
+  "name": "cf-ai-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare AI Proxy",
+  "keywords": [
+    "cf-ai-proxy",
+    "cloudflare",
+    "ai",
+    "proxy"
+  ],
+  "homepage": "https://github.com/zxdong262-apps/cf-ai-proxy#readme",
+  "bugs": {
+    "url": "https://github.com/zxdong262-apps/cf-ai-proxy/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxdong262-apps/cf-ai-proxy.git"
+  },
+  "license": "MIT",
+  "author": "ZHAO Xudong <zxdong@gmail.com>",
+  "type": "module",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
