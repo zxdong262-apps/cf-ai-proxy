@@ -1,12 +1,14 @@
 {
   "name": "cf-ai-proxy",
   "version": "1.0.0",
-  "description": "Cloudflare AI Proxy",
+  "description": "Cloudflare Worker AI API Proxy with D1 database",
   "keywords": [
-    "cf-ai-proxy",
     "cloudflare",
     "ai",
-    "proxy"
+    "proxy",
+    "d1",
+    "openai",
+    "anthropic"
   ],
   "homepage": "https://github.com/zxdong262-apps/cf-ai-proxy#readme",
   "bugs": {
@@ -22,7 +24,19 @@
   "main": "src/worker.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:watch": "vitest",
+    "db:init": "wrangler d1 execute ai-proxy-db --local --file=schema.sql",
+    "db:init:remote": "wrangler d1 execute ai-proxy-db --remote --file=schema.sql",
+    "db:reset": "wrangler d1 execute ai-proxy-db --local --command='DROP TABLE IF EXISTS routes; DROP TABLE IF EXISTS settings;' && npm run db:init"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.1",
+    "wrangler": "^4.20.0"
   },
   "engines": {
     "node": ">=22.0.0"

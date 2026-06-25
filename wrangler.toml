@@ -1,4 +1,12 @@
-name = "ai"
-compatibility_date = "2024-01-01"
+name = "ai-proxy"
+compatibility_date = "2024-12-01"
 main = "src/worker.js"
 compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ai-proxy-db"
+database_id = "e81147b0-7d13-421f-a88d-c97f3aa8ca10"
+
+[vars]
+MAIN_PASSWORD = ""

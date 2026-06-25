@@ -1,371 +1,318 @@
 /**
  * Cloudflare AI API Proxy Worker
  *
- * Translates OpenAI-compatible and Anthropic Claude-compatible API requests
- * to Cloudflare AI REST API. The Bearer token from the incoming request is
- * forwarded as-is to Cloudflare — no token management needed in this worker.
- *
- * Supported endpoints:
- *   POST /v1/chat/completions      (OpenAI format)
- *   POST /v1/messages              (Anthropic/Claude format)
- *   GET  /v1/models                (live list from Cloudflare AI)
- *
- * Required env var (wrangler.toml [vars] or secret):
- *   CF_ACCOUNT_ID  – your Cloudflare account ID
- *
- * Client usage: pass your Cloudflare API token as the Bearer token.
+ * Routes:
+ *   GET  /                          → Admin management page (password protected)
+ *   POST /api/auth/login            → Login endpoint
+ *   POST /api/auth/logout           → Logout endpoint
+ *   GET  /api/auth/check            → Check auth status
+ *   GET  /api/routes                → List all routes (auth required)
+ *   POST /api/routes                → Create route (auth required)
+ *   PUT  /api/routes/:id            → Update route (auth required)
+ *   DELETE /api/routes/:id          → Delete route (auth required)
+ *   POST /api/routes/test           → Test API format support (auth required)
+ *   GET  /api/settings              → Get settings (auth required)
+ *   PUT  /api/settings              → Update settings (auth required)
+ *   POST /api/settings/generate-token → Generate new global token (auth required)
+ *   POST /api/{name}/v1/chat/completions → OpenAI-compatible proxy
+ *   POST /api/{name}/v1/messages    → Anthropic-compatible proxy
+ *   GET  /api/{name}/v1/models      → Models list proxy
+ *   ANY  /api/{name}/v1/*           → Catch-all proxy
  */
 
-const DEFAULT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-const CF_AI_BASE    = (accountId) =>
-  `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai`;
+import { createSession, validateSession } from './auth.js'
+import { getRoutes, createRoute, updateRoute, deleteRoute, getSetting, updateSetting } from './db.js'
+import { handleProxy, testApiSupport } from './proxy.js'
+import { getAdminPage } from './html.js'
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
 export default {
-  async fetch(request, env) {
-    if (request.method === "OPTIONS") {
-      return cors(new Response(null, { status: 204 }));
+  async fetch(request, env, ctx) {
+    if (request.method === 'OPTIONS') {
+      return cors(new Response(null, { status: 204 }))
     }
 
-    // Extract the client's bearer token — forwarded to Cloudflare as-is
-    const cfToken = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "");
-    if (!cfToken) {
-      return cors(err(401, "missing_token", "Provide your Cloudflare API token as a Bearer token."));
-    }
-
-    if (!env.CF_ACCOUNT_ID) {
-      return cors(err(500, "config_error", "CF_ACCOUNT_ID is not set on this worker."));
-    }
-
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url)
+    const path = url.pathname
 
     try {
-      if (request.method === "GET"  && pathname === "/debug")               return cors(await handleDebug(cfToken, env));
-      if (request.method === "GET"  && pathname === "/v1/models")           return cors(await handleModels(cfToken, env));
-      if (request.method === "POST" && pathname === "/v1/chat/completions") return cors(await handleOpenAI(request, cfToken, env));
-      if (request.method === "POST" && pathname === "/v1/messages")         return cors(await handleAnthropic(request, cfToken, env));
+      // Admin page
+      if (path === '/' || path === '/index.html') {
+        return new Response(getAdminPage(), {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        })
+      }
 
-      return cors(err(404, "not_found", `Unknown path: ${pathname}`));
+      // Auth endpoints
+      if (path === '/api/auth/login' && request.method === 'POST') {
+        return await handleLogin(request, env)
+      }
+      if (path === '/api/auth/logout' && request.method === 'POST') {
+        return handleLogout(env)
+      }
+      if (path === '/api/auth/check' && request.method === 'GET') {
+        return handleAuthCheck(request, env)
+      }
+
+      // Settings endpoints (auth required)
+      if (path === '/api/settings' && request.method === 'GET') {
+        return await handleGetSettings(request, env)
+      }
+      if (path === '/api/settings' && request.method === 'PUT') {
+        return await handleUpdateSettings(request, env)
+      }
+      if (path === '/api/settings/generate-token' && request.method === 'POST') {
+        return await handleGenerateToken(request, env)
+      }
+
+      // Test API support endpoint (must be before routes CRUD)
+      if (path === '/api/routes/test' && request.method === 'POST') {
+        return await handleTestApiSupport(request, env)
+      }
+
+      // Routes CRUD (auth required)
+      if (path === '/api/routes' && request.method === 'GET') {
+        return await handleListRoutes(request, env)
+      }
+      if (path === '/api/routes' && request.method === 'POST') {
+        return await handleCreateRoute(request, env)
+      }
+
+      const routeMatch = path.match(/^\/api\/routes\/(\d+)$/)
+      if (routeMatch) {
+        const id = parseInt(routeMatch[1])
+        if (request.method === 'PUT') return await handleUpdateRoute(request, env, id)
+        if (request.method === 'DELETE') return await handleDeleteRoute(request, env, id)
+      }
+
+      // API proxy: /api/{name}/v1/*
+      const proxyMatch = path.match(/^\/api\/([^/]+)\/v1\/(.*)$/)
+      if (proxyMatch) {
+        const name = proxyMatch[1]
+        const subPath = proxyMatch[2]
+        return await handleProxy(request, env, name, subPath)
+      }
+
+      // Also handle /api/{name}/v1 (no trailing path)
+      const proxyMatch2 = path.match(/^\/api\/([^/]+)\/v1$/)
+      if (proxyMatch2) {
+        const name = proxyMatch2[1]
+        return await handleProxy(request, env, name, '')
+      }
+
+      return json({ error: { type: 'not_found', message: `Unknown path: ${path}` } }, 404)
     } catch (e) {
-      console.error(e);
-      return cors(err(500, "server_error", e.message));
-    }
-  },
-};
-
-// ---------------------------------------------------------------------------
-// GET /v1/models
-// ---------------------------------------------------------------------------
-async function handleModels(cfToken, env) {
-  const res = await cfFetch(`${CF_AI_BASE(env.CF_ACCOUNT_ID)}/models/search`, cfToken);
-  if (!res.ok) return proxyError(res);
-
-  const { result = [] } = await res.json();
-  const now = Math.floor(Date.now() / 1000);
-  return json({
-    object: "list",
-    data: result.map((m) => ({
-      id: m.name,
-      object: "model",
-      created: now,
-      owned_by: "cloudflare",
-      description: m.description ?? "",
-      task: m.task?.name ?? "",
-    })),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// POST /v1/chat/completions  (OpenAI format)
-// ---------------------------------------------------------------------------
-async function handleOpenAI(request, cfToken, env) {
-  const { model, messages, stream = false, max_tokens, temperature, top_p, stop, system } =
-    await request.json();
-
-  const cfModel    = model || DEFAULT_MODEL;
-  const modelErr   = validateModel(cfModel);
-  if (modelErr) return modelErr;
-
-  const cfMessages = normalizeMessages(messages, system);
-  const cfBody     = {
-    messages: cfMessages,
-    stream,
-    ...(max_tokens  != null && { max_tokens }),
-    ...(temperature != null && { temperature }),
-    ...(top_p       != null && { top_p }),
-    ...(stop        != null && { stop }),
-  };
-
-  const res = await cfFetch(`${CF_AI_BASE(env.CF_ACCOUNT_ID)}/run/${cfModel}`, cfToken, cfBody);
-  if (!res.ok) return proxyError(res);
-
-  if (stream) {
-    return new Response(openaiSSEStream(res.body, cfModel), { headers: sseHeaders() });
-  }
-
-  const { result } = await res.json();
-  const text = result?.response ?? "";
-  const now  = Math.floor(Date.now() / 1000);
-
-  return json({
-    id: `chatcmpl-${uid()}`,
-    object: "chat.completion",
-    created: now,
-    model: cfModel,
-    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-    usage: usageStats(cfMessages, text),
-  });
-}
-
-// ---------------------------------------------------------------------------
-// POST /v1/messages  (Anthropic / Claude format)
-// ---------------------------------------------------------------------------
-async function handleAnthropic(request, cfToken, env) {
-  const { model, messages, stream = false, max_tokens = 1024, temperature, top_p, top_k, system, stop_sequences } =
-    await request.json();
-
-  const cfModel    = model || DEFAULT_MODEL;
-  const modelErr   = validateModel(cfModel);
-  if (modelErr) return modelErr;
-
-  const cfMessages = normalizeMessages(messages, system);
-  const cfBody     = {
-    messages: cfMessages,
-    max_tokens,
-    stream,
-    ...(temperature    != null && { temperature }),
-    ...(top_p          != null && { top_p }),
-    ...(top_k          != null && { top_k }),
-    ...(stop_sequences != null && { stop: stop_sequences }),
-  };
-
-  const res = await cfFetch(`${CF_AI_BASE(env.CF_ACCOUNT_ID)}/run/${cfModel}`, cfToken, cfBody);
-  if (!res.ok) return proxyError(res);
-
-  if (stream) {
-    return new Response(anthropicSSEStream(res.body, cfModel), { headers: sseHeaders() });
-  }
-
-  const { result } = await res.json();
-  const text = result?.response ?? "";
-
-  return json({
-    id: `msg_${uid()}`,
-    type: "message",
-    role: "assistant",
-    content: [{ type: "text", text }],
-    model: cfModel,
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: { input_tokens: countTokens(cfMessages), output_tokens: countTokens(text) },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Streaming: CF AI SSE stream → OpenAI SSE chunks
-// ---------------------------------------------------------------------------
-function openaiSSEStream(body, model) {
-  const id      = `chatcmpl-${uid()}`;
-  const now     = Math.floor(Date.now() / 1000);
-  const encoder = new TextEncoder();
-
-  return new ReadableStream({
-    async start(controller) {
-      const reader = body.getReader();
-      const send   = (chunk) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-
-      try {
-        for await (const token of readTokens(reader)) {
-          send({ id, object: "chat.completion.chunk", created: now, model,
-            choices: [{ index: 0, delta: { role: "assistant", content: token }, finish_reason: null }] });
-        }
-        send({ id, object: "chat.completion.chunk", created: now, model,
-          choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      } finally {
-        reader.releaseLock();
-        controller.close();
-      }
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Streaming: CF AI SSE stream → Anthropic SSE events
-// ---------------------------------------------------------------------------
-function anthropicSSEStream(body, model) {
-  const id      = `msg_${uid()}`;
-  const encoder = new TextEncoder();
-
-  return new ReadableStream({
-    async start(controller) {
-      const reader = body.getReader();
-      const send   = (event, data) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-
-      send("message_start", { type: "message_start",
-        message: { id, type: "message", role: "assistant", content: [], model,
-          stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
-      send("content_block_start", { type: "content_block_start", index: 0,
-        content_block: { type: "text", text: "" } });
-      send("ping", { type: "ping" });
-
-      let outTokens = 0;
-      try {
-        for await (const token of readTokens(reader)) {
-          outTokens += countTokens(token);
-          send("content_block_delta", { type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: token } });
-        }
-      } finally {
-        reader.releaseLock();
-      }
-
-      send("content_block_stop",  { type: "content_block_stop", index: 0 });
-      send("message_delta", { type: "message_delta",
-        delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outTokens } });
-      send("message_stop", { type: "message_stop" });
-      controller.close();
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/** POST to Cloudflare AI REST API with the client's token */
-function cfFetch(url, cfToken, body) {
-  return fetch(url, {
-    method: body ? "POST" : "GET",
-    headers: {
-      "Authorization": `Bearer ${cfToken}`,
-      "Content-Type": "application/json",
-    },
-    ...(body && { body: JSON.stringify(body) }),
-  });
-}
-
-/** Proxy a non-OK Cloudflare response back to the client */
-async function proxyError(res) {
-  const text = await res.text();
-  return new Response(text, { status: res.status, headers: { "Content-Type": "application/json" } });
-}
-
-/** Async generator: yields decoded token strings from a CF AI SSE stream reader */
-async function* readTokens(reader) {
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const raw = typeof value === "string" ? value : new TextDecoder().decode(value);
-    for (const line of raw.split("\n").filter((l) => l.trim())) {
-      const dataStr = line.startsWith("data: ") ? line.slice(6) : line;
-      if (dataStr === "[DONE]") continue;
-      try {
-        const parsed = JSON.parse(dataStr);
-        const token  = parsed?.response ?? parsed?.token ?? "";
-        if (token) yield token;
-      } catch {
-        if (dataStr) yield dataStr;
-      }
+      console.error('Worker error:', e)
+      return json({ error: { type: 'server_error', message: e.message } }, 500)
     }
   }
 }
 
-/**
- * Normalise messages for Cloudflare AI:
- * - Prepend top-level `system` string if provided
- * - Flatten Anthropic multi-part content blocks to plain strings
- * - Merge consecutive system messages
- */
-function normalizeMessages(messages = [], systemPrompt) {
-  const out = [];
+// ---------------------------------------------------------------------------
+// Auth handlers
+// ---------------------------------------------------------------------------
 
-  if (systemPrompt) out.push({ role: "system", content: systemPrompt });
+async function handleLogin(request, env) {
+  const { password } = await request.json()
+  const mainPassword = env.MAIN_PASSWORD
 
-  for (const msg of messages) {
-    const role    = msg.role === "assistant" ? "assistant"
-                  : msg.role === "system"    ? "system"
-                  :                            "user";
-
-    const content = typeof msg.content === "string"
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.map((b) =>
-            typeof b === "string"    ? b
-          : b.type === "text"        ? (b.text ?? "")
-          : b.type === "tool_result" ? JSON.stringify(b.content ?? "")
-          :                            ""
-          ).join("\n").trim()
-        : "";
-
-    const existingSystem = out.find((m) => m.role === "system");
-    if (role === "system" && existingSystem) {
-      existingSystem.content += "\n" + content;
-    } else {
-      out.push({ role, content });
-    }
+  if (!mainPassword) {
+    return json({ error: { type: 'config_error', message: 'MAIN_PASSWORD not set' } }, 500)
   }
 
-  return out;
+  if (!password || password !== mainPassword) {
+    return json({ error: { type: 'auth_error', message: 'Invalid password' } }, 401)
+  }
+
+  const token = await createSession(env)
+  const response = json({ success: true, token })
+  response.headers.set('Set-Cookie', `session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`)
+  return response
 }
 
-function countTokens(input) {
-  if (!input) return 0;
-  return Math.ceil((typeof input === "string" ? input : JSON.stringify(input)).length / 4);
+function handleLogout(env) {
+  const response = json({ success: true })
+  response.headers.set('Set-Cookie', 'session=; Path=/; HttpOnly; Max-Age=0')
+  return response
 }
 
-function usageStats(msgs, text) {
-  const p = countTokens(msgs), c = countTokens(text);
-  return { prompt_tokens: p, completion_tokens: c, total_tokens: p + c };
+function handleAuthCheck(request, env) {
+  const isAuth = validateSession(request, env)
+  return json({ authenticated: isAuth })
 }
 
-function uid() { return Math.random().toString(36).slice(2, 11); }
+// ---------------------------------------------------------------------------
+// Settings handlers
+// ---------------------------------------------------------------------------
+
+async function handleGetSettings(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const token = await getSetting(env.DB, 'global_api_token')
+  return json({ global_api_token: token || '' })
+}
+
+async function handleUpdateSettings(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const { global_api_token } = await request.json()
+  await updateSetting(env.DB, 'global_api_token', global_api_token || '')
+  return json({ success: true })
+}
+
+async function handleGenerateToken(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const token = generateToken()
+  await updateSetting(env.DB, 'global_api_token', token)
+  return json({ token })
+}
+
+// ---------------------------------------------------------------------------
+// Routes CRUD handlers
+// ---------------------------------------------------------------------------
+
+async function handleListRoutes(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const routes = await getRoutes(env.DB)
+  return json(routes)
+}
+
+async function handleCreateRoute(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const body = await request.json()
+  const {
+    name, remote_api_url, api_key, messages_endpoint, anthropic_endpoint,
+    supports_openai, supports_anthropic, auth_type, enabled
+  } = body
+
+  if (!name || !remote_api_url) {
+    return json({ error: { type: 'validation_error', message: 'name and remote_api_url are required' } }, 400)
+  }
+
+  // Validate name format (alphanumeric, hyphens, underscores)
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return json({ error: { type: 'validation_error', message: 'name can only contain letters, numbers, hyphens, and underscores' } }, 400)
+  }
+
+  try {
+    const id = await createRoute(env.DB, {
+      name,
+      remote_api_url,
+      api_key: api_key || '',
+      messages_endpoint: messages_endpoint || '/chat/completions',
+      anthropic_endpoint: anthropic_endpoint || '/messages',
+      supports_openai: supports_openai !== undefined ? supports_openai : true,
+      supports_anthropic: supports_anthropic !== undefined ? supports_anthropic : false,
+      auth_type: auth_type || 'bearer',
+      enabled: enabled !== undefined ? (enabled ? 1 : 0) : 1
+    })
+    return json({ id, success: true }, 201)
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) {
+      return json({ error: { type: 'validation_error', message: 'Route name already exists' } }, 409)
+    }
+    throw e
+  }
+}
+
+async function handleUpdateRoute(request, env, id) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const body = await request.json()
+  const {
+    name, remote_api_url, api_key, messages_endpoint, anthropic_endpoint,
+    supports_openai, supports_anthropic, auth_type, enabled
+  } = body
+
+  if (name && !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return json({ error: { type: 'validation_error', message: 'name can only contain letters, numbers, hyphens, and underscores' } }, 400)
+  }
+
+  try {
+    await updateRoute(env.DB, id, {
+      name,
+      remote_api_url,
+      api_key,
+      messages_endpoint,
+      anthropic_endpoint,
+      supports_openai,
+      supports_anthropic,
+      auth_type,
+      enabled: enabled !== undefined ? (enabled ? 1 : 0) : undefined
+    })
+    return json({ success: true })
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) {
+      return json({ error: { type: 'validation_error', message: 'Route name already exists' } }, 409)
+    }
+    throw e
+  }
+}
+
+async function handleDeleteRoute(request, env, id) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  await deleteRoute(env.DB, id)
+  return json({ success: true })
+}
+
+// ---------------------------------------------------------------------------
+// Test API support handler
+// ---------------------------------------------------------------------------
+
+async function handleTestApiSupport(request, env) {
+  if (!validateSession(request, env)) {
+    return json({ error: { type: 'auth_error', message: 'Authentication required' } }, 401)
+  }
+
+  const { url, api_key } = await request.json()
+
+  if (!url) {
+    return json({ error: { type: 'validation_error', message: 'url is required' } }, 400)
+  }
+
+  const results = await testApiSupport(env, url, api_key || '')
+  return json(results)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function generateToken() {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return 'sk-' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+}
 
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
-}
-
-function err(status, type, message) { return json({ error: { type, message } }, status); }
-
-function sseHeaders() {
-  return { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" };
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' }
+  })
 }
 
 function cors(response) {
-  const r = new Response(response.body, response);
-  r.headers.set("Access-Control-Allow-Origin", "*");
-  r.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  r.headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version");
-  return r;
-}
-
-// ---------------------------------------------------------------------------
-// GET /debug — show exactly what the worker sees
-// ---------------------------------------------------------------------------
-async function handleDebug(cfToken, env) {
-  const accountId = env.CF_ACCOUNT_ID ?? "(not set)";
-  const tokenPreview = cfToken ? cfToken.slice(0, 6) + "..." + cfToken.slice(-4) : "(empty)";
-  const testUrl = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search`;
-
-  // Try the actual request to CF so we can show the raw response
-  let cfStatus, cfBody;
-  try {
-    const res = await fetch(testUrl, { headers: { Authorization: `Bearer ${cfToken}` } });
-    cfStatus = res.status;
-    cfBody   = await res.json();
-  } catch (e) {
-    cfStatus = "fetch_error";
-    cfBody   = e.message;
-  }
-
-  return json({
-    cf_account_id:  accountId,
-    token_preview:  tokenPreview,
-    test_url:       testUrl,
-    cf_status:      cfStatus,
-    cf_response:    cfBody,
-  });
+  const r = new Response(response.body, response)
+  r.headers.set('Access-Control-Allow-Origin', '*')
+  r.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+  r.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie')
+  r.headers.set('Access-Control-Allow-Credentials', 'true')
+  return r
 }
